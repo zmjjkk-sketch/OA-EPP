@@ -10,6 +10,7 @@
 """
 
 import datetime
+import json
 from typing import Any, Dict, List, Optional
 
 try:
@@ -18,337 +19,304 @@ except Exception:
     rx = None
 
 
-class WorkflowState(rx.State):
-    """Issue-PR 关联规则状态管理
+if rx is not None:
+    class WorkflowState(rx.State):
+        """Issue-PR 关联规则状态管理"""
 
-    对齐需求 F-T-007：
-    - 教师可开启/关闭 Issue 必须关联 PR 规则
-    - 规则生效后在平台内关闭 Issue 时强制弹框要求填写已存在 PR 编号
-    - 实时 GitHub API 校验 PR 编号
-    - 支持 Webhook 监听 GitHub 直接关闭事件
-    - 未关联 PR 则生成后台警告记录
-    - 规则配置按课程独立设置
-    """
+        # ── 核心状态变量 ──
+        require_pr_on_close: bool = True
+        require_merged_pr: bool = False
+        course_rules: Dict[str, Dict[str, Any]] = {}
+        issue_pr_associations: List[Dict[str, Any]] = []
+        warnings: List[Dict[str, Any]] = []
+        pr_validation_result: Dict[str, Any] = {}
 
-    # ── 核心状态变量 ──
-    require_pr_on_close: bool = True
-    """关闭 Issue 时是否必须关联 PR（默认开启）"""
+        # ── UI 状态变量 ──
+        pr_number_input: str = ""
+        show_pr_modal: bool = False
+        current_issue: Optional[Dict[str, Any]] = None
+        selected_course_id: str = ""
+        course_id_input: str = ""
+        editing_course_id: str = ""
+        show_unmerged_confirm: bool = False
+        pending_close_data: Optional[Dict[str, Any]] = None
+        toast_message: str = ""
+        toast_type: str = "info"
 
-    require_merged_pr: bool = False
-    """是否要求 PR 已合并才能关闭 Issue"""
+        _github_token: Optional[str] = None
 
-    course_rules: Dict[str, Dict[str, Any]] = {}
-    """各课程的独立规则配置：{course_id: {require_pr_on_close, require_merged_pr}}"""
+        # ── 规则配置 ──
 
-    issue_pr_associations: List[Dict[str, Any]] = []
-    """Issue-PR 关联记录列表"""
+        def toggle_pr_required(self, value: bool):
+            self.require_pr_on_close = value
 
-    warnings: List[Dict[str, Any]] = []
-    """未关联 PR 直接关闭的警告记录"""
+        def toggle_merged_required(self, value: bool):
+            self.require_merged_pr = value
 
-    pr_validation_result: Dict[str, Any] = {}
-    """当前 PR 验证结果"""
+        def set_global_rule(self, require_pr_on_close: bool, require_merged_pr: bool):
+            self.require_pr_on_close = require_pr_on_close
+            self.require_merged_pr = require_merged_pr
 
-    # ── UI 状态变量 ──
-    pr_number_input: str = ""
-    """用户输入的 PR 编号"""
+        def set_course_rule(self, course_id: str, require_pr_on_close: bool, require_merged_pr: bool):
+            self.course_rules[course_id] = {
+                "course_id": course_id,
+                "require_pr_on_close": require_pr_on_close,
+                "require_merged_pr": require_merged_pr,
+                "updated_at": datetime.datetime.now().isoformat(),
+            }
 
-    show_pr_modal: bool = False
-    """是否显示 PR 输入弹窗"""
+        def get_course_rule(self, course_id: str) -> Dict[str, Any]:
+            if course_id in self.course_rules:
+                return self.course_rules[course_id]
+            return {
+                "course_id": course_id,
+                "require_pr_on_close": self.require_pr_on_close,
+                "require_merged_pr": self.require_merged_pr,
+            }
 
-    current_issue: Optional[Dict[str, Any]] = None
-    """当前正在处理的 Issue"""
+        def remove_course_rule(self, course_id: str):
+            self.course_rules.pop(course_id, None)
 
-    # ── 私有属性 ──
-    _github_token: Optional[str] = None
+        def update_course_id_input(self, value: str):
+            self.course_id_input = value
 
-    # ── 规则配置方法 ──
+        def update_editing_course_id(self, value: str):
+            self.editing_course_id = value
 
-    def set_global_rule(self, require_pr_on_close: bool, require_merged_pr: bool) -> None:
-        """设置全局规则配置
+        def add_course_rule_ui(self):
+            cid = self.course_id_input.strip()
+            if cid:
+                self.set_course_rule(cid, True, False)
+                self.course_id_input = ""
+                self.toast_message = f"课程 {cid} 规则已添加"
+                self.toast_type = "success"
 
-        Args:
-            require_pr_on_close: 关闭 Issue 时是否必须关联 PR
-            require_merged_pr: 是否要求 PR 已合并
-        """
-        self.require_pr_on_close = require_pr_on_close
-        self.require_merged_pr = require_merged_pr
+        def edit_course_rule_ui(self, course_id: str):
+            self.editing_course_id = course_id
 
-    def set_course_rule(self, course_id: str, require_pr_on_close: bool, require_merged_pr: bool) -> None:
-        """设置特定课程的规则配置
+        def save_edited_course_rule(self, course_id: str, require_pr: bool, require_merged: bool):
+            self.set_course_rule(course_id, require_pr, require_merged)
+            self.editing_course_id = ""
 
-        Args:
-            course_id: 课程 ID
-            require_pr_on_close: 关闭 Issue 时是否必须关联 PR
-            require_merged_pr: 是否要求 PR 已合并
-        """
-        self.course_rules[course_id] = {
-            "course_id": course_id,
-            "require_pr_on_close": require_pr_on_close,
-            "require_merged_pr": require_merged_pr,
-            "updated_at": datetime.datetime.now().isoformat(),
-        }
+        # ── PR 验证 ──
 
-    def get_course_rule(self, course_id: str) -> Dict[str, Any]:
-        """获取特定课程的规则配置，如果不存在则返回全局配置
+        async def validate_pr_number(self, pr_number: int, owner: str = "roboticsystem", repo: str = "OA-EPP") -> Dict[str, Any]:
+            self.pr_validation_result = await self._validate_pr_via_api(owner, repo, pr_number)
+            return self.pr_validation_result
 
-        Args:
-            course_id: 课程 ID
+        async def _validate_pr_via_api(self, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+            try:
+                import os
+                import httpx
 
-        Returns:
-            课程规则配置
-        """
-        if course_id in self.course_rules:
-            return self.course_rules[course_id]
-        return {
-            "course_id": course_id,
-            "require_pr_on_close": self.require_pr_on_close,
-            "require_merged_pr": self.require_merged_pr,
-        }
+                api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+                headers = {}
+                if self._github_token or os.environ.get("GITHUB_TOKEN"):
+                    token = self._github_token or os.environ.get("GITHUB_TOKEN")
+                    headers["Authorization"] = f"token {token}"
 
-    # ── PR 验证方法 ──
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(api_url, headers=headers, timeout=10)
 
-    async def validate_pr_number(self, pr_number: int, owner: str = "roboticsystem", repo: str = "OA-EPP") -> Dict[str, Any]:
-        """验证 PR 编号是否存在，并返回 PR 状态信息
+                if response.status_code == 404:
+                    return {
+                        "valid": False,
+                        "exists": False,
+                        "message": f"PR #{pr_number} 不存在",
+                    }
+                if response.status_code != 200:
+                    return {
+                        "valid": False,
+                        "exists": False,
+                        "message": f"GitHub API 请求失败: {response.status_code}",
+                    }
 
-        Args:
-            pr_number: PR 编号
-            owner: GitHub 仓库所有者
-            repo: GitHub 仓库名称
+                data = response.json()
+                is_merged = data.get("merged", False) or (data.get("merged_at") is not None)
 
-        Returns:
-            验证结果：{valid, exists, number, title, state, is_merged, message}
-        """
-        self.pr_validation_result = await self._validate_pr_via_api(owner, repo, pr_number)
-        return self.pr_validation_result
-
-    async def _validate_pr_via_api(self, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
-        """通过 GitHub API 验证 PR"""
-        try:
-            import os
-            import httpx
-
-            api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-            headers = {}
-            
-            if self._github_token or os.environ.get("GITHUB_TOKEN"):
-                token = self._github_token or os.environ.get("GITHUB_TOKEN")
-                headers["Authorization"] = f"token {token}"
-
-            async with httpx.AsyncClient() as client:
-                response = await client.get(api_url, headers=headers, timeout=10)
-
-            if response.status_code == 404:
+                return {
+                    "valid": True,
+                    "exists": True,
+                    "number": data.get("number", 0),
+                    "title": data.get("title", ""),
+                    "state": data.get("state", ""),
+                    "is_merged": is_merged,
+                    "merged_at": data.get("merged_at"),
+                    "user_login": data.get("user", {}).get("login", ""),
+                    "url": data.get("html_url", ""),
+                    "message": f"PR #{pr_number} 验证成功",
+                }
+            except Exception as e:
                 return {
                     "valid": False,
                     "exists": False,
-                    "message": f"PR #{pr_number} 不存在",
+                    "message": f"验证失败: {str(e)}",
                 }
 
-            if response.status_code != 200:
-                return {
-                    "valid": False,
-                    "exists": False,
-                    "message": f"GitHub API 请求失败: {response.status_code}",
-                }
+        def update_pr_input(self, value: str):
+            self.pr_number_input = value
+            self.pr_validation_result = {}
+            if value.isdigit():
+                import asyncio
+                asyncio.create_task(self._validate_pr_via_api("roboticsystem", "OA-EPP", int(value)))
 
-            data = response.json()
-            is_merged = data.get("merged", False) or (data.get("merged_at") is not None)
+        def open_pr_modal(self, issue: Dict[str, Any]):
+            self.current_issue = issue
+            self.pr_number_input = ""
+            self.pr_validation_result = {}
+            self.show_pr_modal = True
 
-            return {
-                "valid": True,
-                "exists": True,
-                "number": data.get("number", 0),
-                "title": data.get("title", ""),
-                "state": data.get("state", ""),
-                "is_merged": is_merged,
-                "merged_at": data.get("merged_at"),
-                "user_login": data.get("user", {}).get("login", ""),
-                "url": data.get("html_url", ""),
-                "message": f"PR #{pr_number} 验证成功",
-            }
+        def close_pr_modal(self):
+            self.show_pr_modal = False
+            self.current_issue = None
+            self.pr_number_input = ""
+            self.pr_validation_result = {}
+            self.show_unmerged_confirm = False
+            self.pending_close_data = None
 
-        except Exception as e:
-            return {
-                "valid": False,
-                "exists": False,
-                "message": f"验证失败: {str(e)}",
-            }
-
-    # ── Issue 关闭方法 ──
-
-    async def close_issue_with_pr(
-        self,
-        issue_number: int,
-        pr_number: int,
-        course_id: str,
-        closed_by: str,
-        owner: str = "roboticsystem",
-        repo: str = "OA-EPP",
-    ) -> Dict[str, Any]:
-        """关闭 Issue 并关联 PR
-
-        Args:
-            issue_number: Issue 编号
-            pr_number: PR 编号
-            course_id: 课程 ID
-            closed_by: 关闭 Issue 的用户
-            owner: GitHub 仓库所有者
-            repo: GitHub 仓库名称
-
-        Returns:
-            操作结果
-        """
-        rule = self.get_course_rule(course_id)
-
-        if not rule.get("require_pr_on_close", True):
-            await self._record_close_action(issue_number, None, course_id, closed_by)
-            return {
-                "success": True,
-                "message": "Issue 已关闭（规则未启用）",
-                "requires_pr": False,
-            }
-
-        validation = await self.validate_pr_number(pr_number, owner, repo)
-        if not validation.get("valid"):
-            return {
-                "success": False,
-                "message": validation.get("message", "PR 验证失败"),
-                "requires_pr": True,
-            }
-
-        if rule.get("require_merged_pr", False) and not validation.get("is_merged"):
-            return {
-                "success": False,
-                "message": "请先合并 PR 后再关闭 Issue",
-                "requires_pr": True,
-                "pr_info": validation,
-            }
-
-        await self._record_association(issue_number, pr_number, validation, course_id, closed_by)
-
-        return {
-            "success": True,
-            "message": f"Issue #{issue_number} 已关闭，关联 PR #{pr_number}",
-            "requires_pr": True,
-            "pr_info": validation,
-        }
-
-    async def handle_github_webhook(self, event_data: Dict[str, Any]) -> None:
-        """处理 GitHub Webhook 事件（监听直接关闭 Issue 的情况）"""
-        try:
-            if event_data.get("action") != "closed":
+        def confirm_close_issue(self):
+            if not self.current_issue or not self.pr_number_input.isdigit():
+                self.toast_message = "请输入有效的 PR 编号"
+                self.toast_type = "error"
                 return
-
-            issue = event_data.get("issue", {})
-            if not issue:
-                return
-
-            issue_number = issue.get("number")
-            issue_title = issue.get("title", "")
-            closed_by = issue.get("closed_by", {}).get("login", "")
-            closed_at = issue.get("closed_at")
-
-            if not issue_number:
-                return
-
-            has_pr_link = False
-            body = issue.get("body", "")
-            if body and ("#" in body or "pull/" in body):
-                has_pr_link = True
-
-            for comment in event_data.get("comments", []):
-                if "#" in comment.get("body", ""):
-                    has_pr_link = True
-
-            if not has_pr_link:
-                await self._generate_warning(issue_number, issue_title, closed_by, closed_at)
-
-        except Exception:
-            pass
-
-    # ── 记录管理方法 ──
-
-    async def _record_association(
-        self,
-        issue_number: int,
-        pr_number: int,
-        pr_info: Dict[str, Any],
-        course_id: str,
-        closed_by: str,
-    ) -> None:
-        """记录 Issue-PR 关联"""
-        association = {
-            "id": len(self.issue_pr_associations) + 1,
-            "course_id": course_id,
-            "issue_number": issue_number,
-            "pr_number": pr_number,
-            "pr_title": pr_info.get("title", ""),
-            "pr_state": pr_info.get("state", ""),
-            "pr_merged_at": pr_info.get("merged_at"),
-            "closed_by": closed_by,
-            "closed_at": datetime.datetime.now().isoformat(),
-        }
-        self.issue_pr_associations.append(association)
-
-    async def _record_close_action(self, issue_number: int, pr_number: Optional[int], course_id: str, closed_by: str) -> None:
-        """记录 Issue 关闭操作"""
-        if pr_number:
-            await self._record_association(issue_number, pr_number, {}, course_id, closed_by)
-
-    async def _generate_warning(
-        self, issue_number: int, issue_title: str, closed_by: str, closed_at: Optional[str]
-    ) -> None:
-        """生成未关联 PR 关闭的警告记录"""
-        warning = {
-            "id": len(self.warnings) + 1,
-            "issue_number": issue_number,
-            "issue_title": issue_title,
-            "closed_by": closed_by,
-            "closed_at": closed_at or datetime.datetime.now().isoformat(),
-            "warning_type": "no_pr_associated",
-            "warning_message": f"Issue #{issue_number} 被直接关闭，未关联 PR",
-            "resolved": False,
-            "resolved_at": None,
-            "created_at": datetime.datetime.now().isoformat(),
-        }
-        self.warnings.append(warning)
-
-    async def resolve_warning(self, warning_id: int) -> None:
-        """标记警告已处理"""
-        for warning in self.warnings:
-            if warning.get("id") == warning_id:
-                warning["resolved"] = True
-                warning["resolved_at"] = datetime.datetime.now().isoformat()
-                break
-
-    async def load_associations(self, course_id: Optional[str] = None) -> None:
-        """加载 Issue-PR 关联记录"""
-        self.issue_pr_associations = []
-
-    async def load_warnings(self, course_id: Optional[str] = None, resolved: Optional[bool] = None) -> None:
-        """加载警告记录"""
-        self.warnings = []
-
-    # ── UI 交互方法 ──
-
-    def open_pr_modal(self, issue: Dict[str, Any]) -> None:
-        """打开 PR 输入弹窗"""
-        self.current_issue = issue
-        self.pr_number_input = ""
-        self.pr_validation_result = {}
-        self.show_pr_modal = True
-
-    def close_pr_modal(self) -> None:
-        """关闭 PR 输入弹窗"""
-        self.show_pr_modal = False
-        self.current_issue = None
-        self.pr_number_input = ""
-        self.pr_validation_result = {}
-
-    def update_pr_input(self, value: str) -> None:
-        """更新 PR 编号输入"""
-        self.pr_number_input = value
-        if value.isdigit():
             import asyncio
-            asyncio.create_task(self.validate_pr_number(int(value)))
+            asyncio.create_task(self._do_close_issue())
+
+        async def _do_close_issue(self):
+            issue = self.current_issue or {}
+            pr_num = int(self.pr_number_input)
+            course_id = self.selected_course_id or "default"
+            closed_by = "teacher"
+
+            rule = self.get_course_rule(course_id)
+            validation = await self._validate_pr_via_api("roboticsystem", "OA-EPP", pr_num)
+
+            if not validation.get("valid"):
+                self.pr_validation_result = validation
+                return
+
+            if rule.get("require_merged_pr", False) and not validation.get("is_merged"):
+                self.pending_close_data = {
+                    "issue": issue,
+                    "pr_number": pr_num,
+                    "pr_info": validation,
+                    "course_id": course_id,
+                }
+                self.show_unmerged_confirm = True
+                return
+
+            await self._record_association(issue.get("number", 0), pr_num, validation, course_id, closed_by)
+            self.show_pr_modal = False
+            self.current_issue = None
+            self.pr_number_input = ""
+            self.pr_validation_result = {}
+            self.toast_message = f"Issue #{issue.get('number')} 已关闭，关联 PR #{pr_num}"
+            self.toast_type = "success"
+
+        def confirm_unmerged_close(self):
+            if not self.pending_close_data:
+                return
+            data = self.pending_close_data
+            import asyncio
+            asyncio.create_task(self._do_unmerged_close(data))
+            self.show_unmerged_confirm = False
+            self.pending_close_data = None
+
+        async def _do_unmerged_close(self, data: Dict[str, Any]):
+            issue = data["issue"]
+            pr_num = data["pr_number"]
+            pr_info = data["pr_info"]
+            course_id = data["course_id"]
+            closed_by = "teacher"
+
+            await self._record_association(issue.get("number", 0), pr_num, pr_info, course_id, closed_by)
+            self.show_pr_modal = False
+            self.current_issue = None
+            self.pr_number_input = ""
+            self.pr_validation_result = {}
+            self.toast_message = f"Issue #{issue.get('number')} 已关闭（未合并 PR #{pr_num}）"
+            self.toast_type = "warning"
+
+        def cancel_unmerged_close(self):
+            self.show_unmerged_confirm = False
+            self.pending_close_data = None
+
+        # ── Webhook ──
+
+        async def handle_github_webhook(self, event_data: Dict[str, Any]):
+            try:
+                if event_data.get("action") != "closed":
+                    return
+                issue = event_data.get("issue", {})
+                if not issue:
+                    return
+                issue_number = issue.get("number")
+                issue_title = issue.get("title", "")
+                closed_by = issue.get("closed_by", {}).get("login", "")
+                closed_at = issue.get("closed_at")
+                if not issue_number:
+                    return
+
+                has_pr_link = False
+                body = issue.get("body", "")
+                if body and ("#" in body or "pull/" in body):
+                    has_pr_link = True
+                for comment in event_data.get("comments", []):
+                    if "#" in comment.get("body", ""):
+                        has_pr_link = True
+                if not has_pr_link:
+                    await self._generate_warning(issue_number, issue_title, closed_by, closed_at)
+            except Exception:
+                pass
+
+        def get_webhook_payload(self) -> Dict[str, Any]:
+            return {"url": "/api/webhook/issue-close", "description": "监听 Issue 关闭事件"}
+
+        # ── 记录管理 ──
+
+        async def _record_association(self, issue_number: int, pr_number: int, pr_info: Dict[str, Any], course_id: str, closed_by: str):
+            association = {
+                "id": len(self.issue_pr_associations) + 1,
+                "course_id": course_id,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "pr_title": pr_info.get("title", ""),
+                "pr_state": pr_info.get("state", ""),
+                "pr_is_merged": pr_info.get("is_merged", False),
+                "pr_merged_at": pr_info.get("merged_at"),
+                "pr_url": pr_info.get("url", ""),
+                "closed_by": closed_by,
+                "closed_at": datetime.datetime.now().isoformat(),
+            }
+            self.issue_pr_associations.append(association)
+
+        async def _generate_warning(self, issue_number: int, issue_title: str, closed_by: str, closed_at: Optional[str]):
+            warning = {
+                "id": len(self.warnings) + 1,
+                "issue_number": issue_number,
+                "issue_title": issue_title,
+                "closed_by": closed_by,
+                "closed_at": closed_at or datetime.datetime.now().isoformat(),
+                "warning_type": "no_pr_associated",
+                "warning_message": f"Issue #{issue_number} 被直接关闭，未关联 PR",
+                "resolved": False,
+                "resolved_at": None,
+                "created_at": datetime.datetime.now().isoformat(),
+            }
+            self.warnings.append(warning)
+
+        def resolve_warning(self, warning_id: int):
+            for warning in self.warnings:
+                if warning.get("id") == warning_id:
+                    warning["resolved"] = True
+                    warning["resolved_at"] = datetime.datetime.now().isoformat()
+                    break
+
+        # ── Toast ──
+
+        def clear_toast(self):
+            self.toast_message = ""
+            self.toast_type = "info"
+
+else:
+    WorkflowState = None
