@@ -38,27 +38,24 @@ def _html_fallback():
 
 workflow_page = None
 if rx is not None:
-    from ..states.issue_pr import IssuePRState
+    from ..states.workflow import WorkflowState
 
     def workflow_page():
         """Issue-PR 关联规则管理页面（教师端）"""
         return rx.container(
             rx.vstack(
-                # 页面标题
                 rx.heading("工作流管理", size="5"),
                 rx.text("Issue-PR 关联规则配置", color="gray"),
                 
-                # 规则配置卡片
                 rx.box(
                     rx.vstack(
                         rx.heading("规则配置", size="4"),
                         
-                        # 全局规则开关
                         rx.vstack(
                             rx.hstack(
                                 rx.checkbox(
                                     default_checked=True,
-                                    on_change=IssuePRState.set_global_rule(
+                                    on_change=WorkflowState.set_global_rule(
                                         require_pr_on_close=True,
                                         require_merged_pr=False
                                     ),
@@ -70,7 +67,7 @@ if rx is not None:
                             rx.hstack(
                                 rx.checkbox(
                                     default_checked=False,
-                                    on_change=IssuePRState.set_global_rule(
+                                    on_change=WorkflowState.set_global_rule(
                                         require_pr_on_close=True,
                                         require_merged_pr=True
                                     ),
@@ -83,16 +80,14 @@ if rx is not None:
                             width="100%",
                         ),
 
-                        # 课程规则配置（示例）
                         rx.divider(),
                         rx.heading("课程独立规则", size="4"),
                         rx.text("各课程可独立配置规则", color="gray"),
                         
-                        # 规则状态提示
                         rx.box(
                             rx.text("当前全局规则状态："),
-                            rx.text(f"  - 强制关联 PR: {'开启' if IssuePRState.require_pr_on_close else '关闭'}"),
-                            rx.text(f"  - 要求合并: {'开启' if IssuePRState.require_merged_pr else '关闭'}"),
+                            rx.text(f"  - 强制关联 PR: {'开启' if WorkflowState.require_pr_on_close else '关闭'}"),
+                            rx.text(f"  - 要求合并: {'开启' if WorkflowState.require_merged_pr else '关闭'}"),
                             background="#f8fafc",
                             padding="12px",
                             border_radius="8px",
@@ -110,14 +105,13 @@ if rx is not None:
                     background="white",
                 ),
 
-                # 警告记录卡片
                 rx.box(
                     rx.vstack(
                         rx.hstack(
                             rx.heading("警告记录", size="4"),
                             rx.button(
                                 "刷新",
-                                on_click=IssuePRState.load_warnings(),
+                                on_click=WorkflowState.load_warnings(),
                                 size="sm",
                             ),
                             justify="space-between",
@@ -125,12 +119,11 @@ if rx is not None:
                             width="100%",
                         ),
                         
-                        # 警告列表
                         rx.cond(
-                            rx.len(IssuePRState.warnings) > 0,
+                            rx.len(WorkflowState.warnings) > 0,
                             rx.vstack(
                                 rx.foreach(
-                                    IssuePRState.warnings,
+                                    WorkflowState.warnings,
                                     lambda warning: rx.box(
                                         rx.hstack(
                                             rx.box(
@@ -145,7 +138,7 @@ if rx is not None:
                                             ),
                                             rx.button(
                                                 "处理",
-                                                on_click=IssuePRState.resolve_warning(warning.id),
+                                                on_click=WorkflowState.resolve_warning(warning.id),
                                                 size="sm",
                                                 variant="outline",
                                             ),

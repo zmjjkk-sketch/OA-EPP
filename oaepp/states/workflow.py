@@ -1,4 +1,4 @@
-"""F-T-007 Issue关闭必填PR编号 — IssuePRState
+"""F-T-007 Issue关闭必填PR编号 — WorkflowState
 
 提供 Issue-PR 关联规则的状态管理：
 - require_pr_on_close: 是否要求关闭 Issue 时关联 PR（默认开启）
@@ -12,8 +12,13 @@
 import datetime
 from typing import Any, Dict, List, Optional
 
+try:
+    import reflex as rx
+except Exception:
+    rx = None
 
-class IssuePRState:
+
+class WorkflowState(rx.State):
     """Issue-PR 关联规则状态管理
 
     对齐需求 F-T-007：
@@ -55,19 +60,7 @@ class IssuePRState:
     """当前正在处理的 Issue"""
 
     # ── 私有属性 ──
-    _db_session: Any = None
     _github_token: Optional[str] = None
-
-    def __init__(self):
-        self.require_pr_on_close = True
-        self.require_merged_pr = False
-        self.course_rules = {}
-        self.issue_pr_associations = []
-        self.warnings = []
-        self.pr_validation_result = {}
-        self.pr_number_input = ""
-        self.show_pr_modal = False
-        self.current_issue = None
 
     # ── 规则配置方法 ──
 
@@ -206,12 +199,9 @@ class IssuePRState:
         Returns:
             操作结果
         """
-        # 获取课程规则
         rule = self.get_course_rule(course_id)
 
-        # 验证规则是否要求关联 PR
         if not rule.get("require_pr_on_close", True):
-            # 规则未启用，直接关闭
             await self._record_close_action(issue_number, None, course_id, closed_by)
             return {
                 "success": True,
@@ -219,7 +209,6 @@ class IssuePRState:
                 "requires_pr": False,
             }
 
-        # 验证 PR
         validation = await self.validate_pr_number(pr_number, owner, repo)
         if not validation.get("valid"):
             return {
@@ -228,7 +217,6 @@ class IssuePRState:
                 "requires_pr": True,
             }
 
-        # 如果要求 PR 已合并
         if rule.get("require_merged_pr", False) and not validation.get("is_merged"):
             return {
                 "success": False,
@@ -237,7 +225,6 @@ class IssuePRState:
                 "pr_info": validation,
             }
 
-        # 记录关联
         await self._record_association(issue_number, pr_number, validation, course_id, closed_by)
 
         return {
@@ -248,13 +235,8 @@ class IssuePRState:
         }
 
     async def handle_github_webhook(self, event_data: Dict[str, Any]) -> None:
-        """处理 GitHub Webhook 事件（监听直接关闭 Issue 的情况）
-
-        Args:
-            event_data: GitHub Webhook 事件数据
-        """
+        """处理 GitHub Webhook 事件（监听直接关闭 Issue 的情况）"""
         try:
-            # 检查是否是 Issue 关闭事件
             if event_data.get("action") != "closed":
                 return
 
@@ -270,20 +252,15 @@ class IssuePRState:
             if not issue_number:
                 return
 
-            # 检查是否有关联的 PR（通过事件数据或 body 中的关键词）
             has_pr_link = False
-            
-            # 检查 body 中是否有 PR 引用
             body = issue.get("body", "")
             if body and ("#" in body or "pull/" in body):
                 has_pr_link = True
 
-            # 检查关闭评论中是否有 PR 引用
             for comment in event_data.get("comments", []):
                 if "#" in comment.get("body", ""):
                     has_pr_link = True
 
-            # 如果没有关联 PR，生成警告
             if not has_pr_link:
                 await self._generate_warning(issue_number, issue_title, closed_by, closed_at)
 
@@ -314,10 +291,6 @@ class IssuePRState:
         }
         self.issue_pr_associations.append(association)
 
-        # 持久化到数据库
-        if hasattr(self, "_db_session") and self._db_session is not None:
-            await self._save_association_to_db(association)
-
     async def _record_close_action(self, issue_number: int, pr_number: Optional[int], course_id: str, closed_by: str) -> None:
         """记录 Issue 关闭操作"""
         if pr_number:
@@ -341,10 +314,6 @@ class IssuePRState:
         }
         self.warnings.append(warning)
 
-        # 持久化到数据库
-        if hasattr(self, "_db_session") and self._db_session is not None:
-            await self._save_warning_to_db(warning)
-
     async def resolve_warning(self, warning_id: int) -> None:
         """标记警告已处理"""
         for warning in self.warnings:
@@ -355,17 +324,11 @@ class IssuePRState:
 
     async def load_associations(self, course_id: Optional[str] = None) -> None:
         """加载 Issue-PR 关联记录"""
-        if hasattr(self, "_db_session") and self._db_session is not None:
-            await self._load_associations_from_db(course_id)
-        else:
-            self.issue_pr_associations = []
+        self.issue_pr_associations = []
 
     async def load_warnings(self, course_id: Optional[str] = None, resolved: Optional[bool] = None) -> None:
         """加载警告记录"""
-        if hasattr(self, "_db_session") and self._db_session is not None:
-            await self._load_warnings_from_db(course_id, resolved)
-        else:
-            self.warnings = []
+        self.warnings = []
 
     # ── UI 交互方法 ──
 
@@ -386,146 +349,6 @@ class IssuePRState:
     def update_pr_input(self, value: str) -> None:
         """更新 PR 编号输入"""
         self.pr_number_input = value
-        # 实时验证
         if value.isdigit():
             import asyncio
             asyncio.create_task(self.validate_pr_number(int(value)))
-
-    # ── 数据库操作（内部方法） ──
-
-    async def _save_association_to_db(self, association: Dict[str, Any]) -> None:
-        """保存关联记录到数据库"""
-        try:
-            from sqlmodel import text as sql_text
-
-            session = self._db_session
-            session.execute(
-                sql_text("""
-                    INSERT INTO issue_pr_associations 
-                    (course_id, issue_number, pr_number, pr_title, pr_state, pr_merged_at, closed_by, closed_at)
-                    VALUES (:course_id, :issue_number, :pr_number, :pr_title, :pr_state, :pr_merged_at, :closed_by, :closed_at)
-                    ON DUPLICATE KEY UPDATE
-                        pr_number = VALUES(pr_number),
-                        pr_title = VALUES(pr_title),
-                        pr_state = VALUES(pr_state),
-                        pr_merged_at = VALUES(pr_merged_at),
-                        closed_by = VALUES(closed_by),
-                        closed_at = VALUES(closed_at)
-                """),
-                {
-                    "course_id": association["course_id"],
-                    "issue_number": association["issue_number"],
-                    "pr_number": association["pr_number"],
-                    "pr_title": association["pr_title"],
-                    "pr_state": association["pr_state"],
-                    "pr_merged_at": association["pr_merged_at"],
-                    "closed_by": association["closed_by"],
-                    "closed_at": association["closed_at"],
-                },
-            )
-            session.commit()
-        except Exception:
-            pass
-
-    async def _save_warning_to_db(self, warning: Dict[str, Any]) -> None:
-        """保存警告记录到数据库"""
-        try:
-            from sqlmodel import text as sql_text
-
-            session = self._db_session
-            session.execute(
-                sql_text("""
-                    INSERT INTO issue_close_warnings
-                    (issue_number, issue_title, closed_by, closed_at, warning_type, warning_message, resolved, created_at)
-                    VALUES (:issue_number, :issue_title, :closed_by, :closed_at, :warning_type, :warning_message, :resolved, :created_at)
-                """),
-                {
-                    "issue_number": warning["issue_number"],
-                    "issue_title": warning["issue_title"],
-                    "closed_by": warning["closed_by"],
-                    "closed_at": warning["closed_at"],
-                    "warning_type": warning["warning_type"],
-                    "warning_message": warning["warning_message"],
-                    "resolved": warning["resolved"],
-                    "created_at": warning["created_at"],
-                },
-            )
-            session.commit()
-        except Exception:
-            pass
-
-    async def _load_associations_from_db(self, course_id: Optional[str] = None) -> None:
-        """从数据库加载关联记录"""
-        try:
-            from sqlmodel import text as sql_text
-
-            session = self._db_session
-            if course_id:
-                result = session.execute(
-                    sql_text("SELECT * FROM issue_pr_associations WHERE course_id = :course_id ORDER BY closed_at DESC"),
-                    {"course_id": course_id},
-                )
-            else:
-                result = session.execute(
-                    sql_text("SELECT * FROM issue_pr_associations ORDER BY closed_at DESC")
-                )
-
-            rows = result.fetchall()
-            self.issue_pr_associations = []
-            for row in rows:
-                self.issue_pr_associations.append({
-                    "id": row.id,
-                    "course_id": row.course_id,
-                    "issue_number": row.issue_number,
-                    "pr_number": row.pr_number,
-                    "pr_title": row.pr_title,
-                    "pr_state": row.pr_state,
-                    "pr_merged_at": row.pr_merged_at.isoformat() if row.pr_merged_at else None,
-                    "closed_by": row.closed_by,
-                    "closed_at": row.closed_at.isoformat() if row.closed_at else None,
-                })
-        except Exception:
-            self.issue_pr_associations = []
-
-    async def _load_warnings_from_db(self, course_id: Optional[str] = None, resolved: Optional[bool] = None) -> None:
-        """从数据库加载警告记录"""
-        try:
-            from sqlmodel import text as sql_text
-
-            session = self._db_session
-            query = "SELECT * FROM issue_close_warnings"
-            params = {}
-
-            conditions = []
-            if course_id:
-                conditions.append("course_id = :course_id")
-                params["course_id"] = course_id
-            if resolved is not None:
-                conditions.append("resolved = :resolved")
-                params["resolved"] = resolved
-
-            if conditions:
-                query += " WHERE " + " AND ".join(conditions)
-
-            query += " ORDER BY created_at DESC"
-
-            result = session.execute(sql_text(query), params)
-            rows = result.fetchall()
-
-            self.warnings = []
-            for row in rows:
-                self.warnings.append({
-                    "id": row.id,
-                    "course_id": row.course_id,
-                    "issue_number": row.issue_number,
-                    "issue_title": row.issue_title,
-                    "closed_by": row.closed_by,
-                    "closed_at": row.closed_at.isoformat() if row.closed_at else None,
-                    "warning_type": row.warning_type,
-                    "warning_message": row.warning_message,
-                    "resolved": bool(row.resolved),
-                    "resolved_at": row.resolved_at.isoformat() if row.resolved_at else None,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
-                })
-        except Exception:
-            self.warnings = []
